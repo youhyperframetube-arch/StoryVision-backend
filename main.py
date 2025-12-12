@@ -4,7 +4,7 @@ import os
 import time
 import uuid
 import random
-from typing import Dict, Optional, Literal, Any
+from typing import Dict, Optional, Literal
 
 import httpx
 from fastapi import FastAPI, HTTPException
@@ -163,6 +163,7 @@ class VideoJob(BaseModel):
     video_width: Optional[int] = None
     video_height: Optional[int] = None
 
+    # Minimax files/retrieve 결과
     download_url: Optional[str] = None
     filename: Optional[str] = None
     bytes: Optional[int] = None
@@ -174,9 +175,8 @@ class VideoJob(BaseModel):
 
 
 VIDEO_JOBS: Dict[str, VideoJob] = {}
-VIDEO_JOB_TTL_SECONDS = 60 * 60 * 6  # 6시간(내부툴 기준 넉넉히)
-
-MIN_POLL_INTERVAL_SEC = 1.5  # 폴링 너무 자주 하면 rate limit 걸릴 수 있음
+VIDEO_JOB_TTL_SECONDS = 60 * 60 * 6  # 6시간
+MIN_POLL_INTERVAL_SEC = 1.5
 
 
 def gc_prompt_jobs() -> None:
@@ -248,7 +248,6 @@ Return ONLY the final English video-generation prompt.'''
             if not output:
                 raise RuntimeError("Empty response from OpenAI")
 
-            # ✅ Minimax length safety
             output = clamp_prompt(output, MAX_PROMPT_CHARS)
             return output
 
@@ -266,7 +265,6 @@ def run_prompt_job(job_id: str, sentence: str) -> None:
             return
 
         prompt = call_gpt_make_video_prompt(sentence)
-
         job.video_prompt = prompt
         job.status = "DONE"
         job.updated_at = now_ts()
@@ -364,7 +362,7 @@ class CreateVideoJobRequest(BaseModel):
     prompt: str = Field(..., min_length=1, description="English prompt (<=2000 chars, we clamp to 1800)")
     model: str = Field(default=DEFAULT_MINIMAX_MODEL)
     duration: int = Field(default=6)
-    resolution: str = Field(default="768P")  # 768P/1080P/720P (모델에 따라)
+    resolution: str = Field(default="768P")
     prompt_optimizer: bool = Field(default=True)
     fast_pretreatment: bool = Field(default=False)
 
@@ -395,6 +393,12 @@ class GetVideoJobResponse(BaseModel):
     video_width: Optional[int] = None
     video_height: Optional[int] = None
 
+    # ✅ 프론트 호환 필드
+    video_url: Optional[str] = None
+    thumbnail_url: Optional[str] = None  # (지금은 미지원이면 None)
+    original_prompt: Optional[str] = None
+
+    # 기존 유지(디버깅)
     download_url: Optional[str] = None
     filename: Optional[str] = None
     bytes: Optional[int] = None
@@ -480,7 +484,6 @@ async def create_video_job(req: CreateVideoJobRequest):
         fast_pretreatment=req.fast_pretreatment,
     )
 
-    # Minimax task 생성
     try:
         mm = await minimax_create_task(
             model=req.model,
@@ -496,7 +499,8 @@ async def create_video_job(req: CreateVideoJobRequest):
         job.status = "PROCESSING"
         job.updated_at = now_ts()
 
-        return CreateVideoJobResponse(job_id=job_id, status="PENDING", minimax_task_id=job.minimax_task_id)
+        # ✅ 상태 일치
+        return CreateVideoJobResponse(job_id=job_id, status="PROCESSING", minimax_task_id=job.minimax_task_id)
 
     except Exception as e:
         job = VIDEO_JOBS.get(job_id)
@@ -515,24 +519,34 @@ async def get_video_job(job_id: str):
     if not job:
         raise HTTPException(status_code=404, detail="job_id not found (or expired)")
 
-    # DONE/ERROR면 그대로 리턴
+    # DONE/ERROR면 그대로 리턴(프론트 호환 필드 포함)
     if job.status in ("DONE", "ERROR"):
-        return GetVideoJobResponse(**job.model_dump(exclude={"_last_poll"}))
+        base = job.model_dump(exclude={"_last_poll"})
+        return GetVideoJobResponse(
+            **base,
+            video_url=job.download_url,
+            thumbnail_url=None,
+            original_prompt=job.prompt,
+        )
 
     # 폴링 과다 방지
     now = now_ts()
     if now - job._last_poll < MIN_POLL_INTERVAL_SEC:
-        return GetVideoJobResponse(**job.model_dump(exclude={"_last_poll"}))
+        base = job.model_dump(exclude={"_last_poll"})
+        return GetVideoJobResponse(
+            **base,
+            video_url=job.download_url,
+            thumbnail_url=None,
+            original_prompt=job.prompt,
+        )
     job._last_poll = now
 
-    # Minimax task 상태 조회 -> success면 file retrieve까지
     try:
         if not job.minimax_task_id:
             raise HTTPException(status_code=400, detail="minimax_task_id missing")
 
         st = await minimax_query_task(job.minimax_task_id)
 
-        # 예상 응답 키: status, file_id, video_width, video_height 등
         mm_status = st.get("status")
         job.minimax_status = mm_status
         job.updated_at = now_ts()
@@ -561,10 +575,23 @@ async def get_video_job(job_id: str):
             job.status = "PROCESSING"
             job.updated_at = now_ts()
 
-        return GetVideoJobResponse(**job.model_dump(exclude={"_last_poll"}))
+        base = job.model_dump(exclude={"_last_poll"})
+        return GetVideoJobResponse(
+            **base,
+            video_url=job.download_url,
+            thumbnail_url=None,
+            original_prompt=job.prompt,
+        )
 
     except Exception as e:
         job.status = "ERROR"
         job.error = str(e)
         job.updated_at = now_ts()
-        return GetVideoJobResponse(**job.model_dump(exclude={"_last_poll"}))
+
+        base = job.model_dump(exclude={"_last_poll"})
+        return GetVideoJobResponse(
+            **base,
+            video_url=job.download_url,
+            thumbnail_url=None,
+            original_prompt=job.prompt,
+        )

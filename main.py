@@ -4,7 +4,7 @@ import os
 import time
 import uuid
 import random
-from typing import Dict, Optional, List, Literal
+from typing import Dict, Optional, Literal
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,13 +13,6 @@ from pydantic import BaseModel, Field
 
 from openai import OpenAI
 
-
-# =========================================================
-# OpenAI Client (키는 환경변수로만)
-# - Render / 로컬 환경변수: OPENAI_API_KEY
-# - 예: OPENAI_API_KEY="MyKey"  (실제 값은 절대 코드에 하드코딩 금지)
-# =========================================================
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 # =========================================================
 # Fixed SYSTEM PROMPT (서버 고정 기준)
@@ -71,13 +64,23 @@ DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 
 
 # =========================================================
+# OpenAI Client Factory (환경변수 안전 처리)
+# =========================================================
+def get_openai_client() -> OpenAI:
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY environment variable is not set")
+    return OpenAI(api_key=api_key)
+
+
+# =========================================================
 # FastAPI
 # =========================================================
 app = FastAPI(title="StoryVision AI Backend - Prompt Generator (MVP)")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 필요시 도메인 제한
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -85,7 +88,7 @@ app.add_middleware(
 
 
 # =========================================================
-# In-memory job store (DB 0)
+# In-memory job store (DB 없음)
 # =========================================================
 JobStatus = Literal["PENDING", "DONE", "ERROR", "EXPIRED"]
 
@@ -99,6 +102,7 @@ class PromptJob(BaseModel):
     video_prompt: Optional[str] = None
     error: Optional[str] = None
 
+
 JOBS: Dict[str, PromptJob] = {}
 JOB_TTL_SECONDS = 60 * 30  # 30분
 
@@ -109,11 +113,11 @@ def now_ts() -> float:
 
 def gc_jobs() -> None:
     t = now_ts()
-    expired_ids = []
-    for job_id, job in JOBS.items():
-        if t - job.created_at > JOB_TTL_SECONDS:
-            expired_ids.append(job_id)
-    for job_id in expired_ids:
+    expired = [
+        job_id for job_id, job in JOBS.items()
+        if t - job.created_at > JOB_TTL_SECONDS
+    ]
+    for job_id in expired:
         JOBS.pop(job_id, None)
 
 
@@ -121,7 +125,7 @@ def gc_jobs() -> None:
 # API Models
 # =========================================================
 class CreatePromptJobRequest(BaseModel):
-    sentence: str = Field(..., min_length=1, description="사용자 한글 문장")
+    sentence: str = Field(..., min_length=1)
 
 
 class CreatePromptJobResponse(BaseModel):
@@ -141,22 +145,22 @@ class GetPromptJobResponse(BaseModel):
 
 
 # =========================================================
-# OpenAI call with simple retry (rate limit/network 대비)
+# GPT 호출 로직
 # =========================================================
 def call_gpt_make_video_prompt(user_sentence: str) -> str:
-    """
-    Returns: Minimax(Hailuo)용 영어 1문단 프롬프트
-    """
-    # 안전하게 따옴표/개행 정리
     user_sentence = user_sentence.strip()
 
-    user_message = f'User sentence:\n"{user_sentence}"\n\nReturn ONLY the final English video-generation prompt.'
+    user_message = f'''User sentence:
+"{user_sentence}"
 
-    # 지수 백오프 재시도 (429/일시 장애)
+Return ONLY the final English video-generation prompt.'''
+
+    client = get_openai_client()
+
     max_tries = 4
-    base = 0.8
+    base_delay = 0.8
+    last_error = None
 
-    last_err = None
     for i in range(max_tries):
         try:
             res = client.responses.create(
@@ -165,27 +169,20 @@ def call_gpt_make_video_prompt(user_sentence: str) -> str:
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": user_message},
                 ],
-                # 프롬프트 길이 과도 방지 (대략)
                 max_output_tokens=220,
             )
 
-            text = (res.output_text or "").strip()
+            output = (res.output_text or "").strip()
+            if not output:
+                raise RuntimeError("Empty response from OpenAI")
 
-            # 마지막 방어: 빈 문자열이면 에러 처리
-            if not text:
-                raise RuntimeError("Empty output from model")
-
-            # 혹시 모델이 따옴표/설명을 붙이면 최소 정리(설명문이 길게 섞이면 다시 보완 가능)
-            # 여기서는 '한 문단 영어 프롬프트'를 기대.
-            return text
+            return output
 
         except Exception as e:
-            last_err = e
-            # backoff + jitter
-            sleep_s = (base * (2 ** i)) + random.uniform(0, 0.25)
-            time.sleep(sleep_s)
+            last_error = e
+            time.sleep(base_delay * (2 ** i) + random.uniform(0, 0.3))
 
-    raise RuntimeError(f"OpenAI call failed after retries: {last_err}")
+    raise RuntimeError(f"OpenAI request failed: {last_error}")
 
 
 def run_prompt_job(job_id: str, sentence: str) -> None:
@@ -194,12 +191,11 @@ def run_prompt_job(job_id: str, sentence: str) -> None:
         if not job:
             return
 
-        video_prompt = call_gpt_make_video_prompt(sentence)
+        prompt = call_gpt_make_video_prompt(sentence)
 
-        job.video_prompt = video_prompt
+        job.video_prompt = prompt
         job.status = "DONE"
         job.updated_at = now_ts()
-        JOBS[job_id] = job
 
     except Exception as e:
         job = JOBS.get(job_id)
@@ -207,7 +203,6 @@ def run_prompt_job(job_id: str, sentence: str) -> None:
             job.status = "ERROR"
             job.error = str(e)
             job.updated_at = now_ts()
-            JOBS[job_id] = job
 
 
 # =========================================================
